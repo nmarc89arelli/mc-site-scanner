@@ -17,7 +17,7 @@ if ( ! class_exists( 'MCSS_Scanner' ) ) :
 
 define( 'MCSS_FILE', __FILE__ );
 // Ed25519 public key. Releases and rules.dat are signed with the matching private key, which lives only on the release machine.
-define( 'MCSS_PUBKEY', '__MCSS_PUBKEY__' );
+define( 'MCSS_PUBKEY', 'vzAz8wkky7UdR705tnIB8HYUgEqIUmVFjOuG9FAqDGw=' );
 
 final class MCSS_Scanner {
 
