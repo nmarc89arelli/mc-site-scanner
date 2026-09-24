@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Relish Security
  * Description: Malware and integrity scanner, rendered-page and vulnerability checks, instant alerts, activity log, central reporting, one-click repair and quarantine, hardening switches and incident response tools. Scanning is read-only and runs in small timed batches. Anything that changes the site only runs when you press it, and is verified and rolled back if the site stops responding.
- * Version: 1.7.0
+ * Version: 1.7.1
  * Author: Marcarelli Consulting
  * Requires PHP: 7.4
  * Requires at least: 5.8
@@ -21,7 +21,7 @@ define( 'MCSS_PUBKEY', 'vzAz8wkky7UdR705tnIB8HYUgEqIUmVFjOuG9FAqDGw=' );
 
 final class MCSS_Scanner {
 
-	const VERSION      = '1.7.0';
+	const VERSION      = '1.7.1';
 	const OPT_STATE    = 'mcss_state';
 	const OPT_FINDINGS = 'mcss_findings';
 	const OPT_RUN      = 'mcss_findings_run';
@@ -1511,6 +1511,137 @@ final class MCSS_Scanner {
 	}
 
 	private static $deep_counts = array();
+	private static $plugin_shape = array();
+
+	/** Does this plugin folder look like a real, distributed plugin (header, many files, readme)? Memoised per slug. */
+	private static function plugin_looks_real( $slug ) {
+		if ( ! isset( self::$plugin_shape[ $slug ] ) ) {
+			$dir   = WP_PLUGIN_DIR . '/' . $slug;
+			$files = is_dir( $dir ) ? (array) @scandir( $dir ) : array();
+			$n     = 0;
+			$hdr   = false;
+			foreach ( $files as $f ) {
+				if ( $f === '.' || $f === '..' ) {
+					continue;
+				}
+				$n++;
+				if ( ! $hdr && substr( $f, -4 ) === '.php' ) {
+					$head = (string) @file_get_contents( $dir . '/' . $f, false, null, 0, 4000 );
+					$hdr  = (bool) preg_match( '~^\s*\*?\s*Plugin Name:\s*\S~mi', $head );
+				}
+			}
+			self::$plugin_shape[ $slug ] = $hdr && ( $n >= 4 || is_file( $dir . '/readme.txt' ) );
+		}
+		return self::$plugin_shape[ $slug ];
+	}
+
+	/**
+	 * How sure the analysis is, as a percentage, from the strength of the evidence and the context.
+	 * Strong: patterns that have almost no honest use. Context: where the file sits and whether it looks like shipped software.
+	 */
+	public static function confidence( $b, $ctx ) {
+		$f    = $b['f'];
+		$c    = 20;
+		$why  = array();
+		$in   = $f['input'] + $f['rawinput'];
+		$strong = 0;
+		if ( $in && $f['eval'] ) {
+			$strong++;
+			$why[] = 'request input reaches eval';
+		}
+		if ( $f['decode'] && $f['eval'] ) {
+			$strong++;
+			$why[] = 'decoded data is evaluated';
+		}
+		if ( $f['built'] && $f['varfunc'] >= 2 ) {
+			$strong++;
+			$why[] = 'function names are assembled from fragments and called';
+		}
+		if ( $f['hideplugin'] && ( $f['auth'] || $f['net'] ) ) {
+			$strong++;
+			$why[] = 'hides from the plugin or user list';
+		}
+		if ( $f['auth'] && $in && ( $f['decode'] || $f['hideplugin'] ) ) {
+			$strong++;
+			$why[] = 'passwordless login combined with decoding or hiding';
+		}
+		$c += min( 50, $strong * 25 );
+		$c += min( 15, (int) ( $b['score'] / 2 ) );
+		if ( $strong && $f['code'] < 800 ) {
+			$c   += 8;
+			$why[] = 'very small file for what it does (dropper-sized)';
+		}
+
+		if ( ! empty( $ctx['in_plugin'] ) ) {
+			if ( ! empty( $ctx['plugin_real'] ) ) {
+				$c   -= 20;
+				$why[] = 'sits inside a plugin that looks like shipped software (header, many files)';
+			} else {
+				$c   += 5;
+				$why[] = 'sits inside a plugin folder that does not look like a distributed plugin';
+			}
+		} else {
+			$c   += 15;
+			$why[] = 'sits in ' . $ctx['where'] . ', where malware is usually placed';
+		}
+		if ( $f['code'] > 0 ) {
+			$ratio = $f['comment'] / ( $f['comment'] + $f['code'] );
+			if ( $ratio > 0.08 ) {
+				$c   -= 10;
+				$why[] = 'well commented (' . (int) ( $ratio * 100 ) . '% comments), which packed malware rarely is';
+			} elseif ( $f['comment'] === 0 && $f['code'] > 1500 ) {
+				$c   += 8;
+				$why[] = 'no comments at all';
+			}
+		}
+		if ( ! empty( $ctx['random_name'] ) ) {
+			$c   += 8;
+			$why[] = 'random-looking file name';
+		}
+		if ( $f['auth'] && $in && ! $strong ) {
+			$why[] = 'passwordless login from request input can be legitimate SSO (hosts, login plugins)';
+		}
+		if ( ( $f['exec'] || $f['write'] ) && $in && ! $strong ) {
+			$why[] = 'commands or file writes from request input are what backup and management connectors do too';
+		}
+		$c = max( 5, min( 97, $c ) );
+		$label = $c >= 70 ? 'likely malicious' : ( $c >= 40 ? 'suspicious, needs a read' : 'unusual but probably legitimate' );
+		return array( $c, $label, $why );
+	}
+
+	/** Plain-language account of what the tokeniser counted. */
+	private static function behaviour_detail( $f ) {
+		$parts = array();
+		$map   = array(
+			'input'       => 'reads request input %d time(s)',
+			'rawinput'    => 'reads the raw request body',
+			'eval'        => 'uses eval %d time(s)',
+			'exec'        => 'runs system commands %d time(s)',
+			'decode'      => 'calls decoders %d time(s) (base64, gzinflate, rot13...)',
+			'varfunc'     => 'calls functions through variables %d time(s)',
+			'built'       => 'assembles names from string fragments %d time(s)',
+			'chr'         => 'builds strings from character codes (%d chr calls)',
+			'include_var' => 'includes a computed or decoded path %d time(s)',
+			'longlit'     => 'has %d long high-entropy string literal(s)',
+			'auth'        => 'sets login state or creates users %d time(s)',
+			'net'         => 'makes outbound requests %d time(s)',
+			'write'       => 'writes files %d time(s)',
+			'inject'      => 'injects into page output %d time(s)',
+			'hideplugin'  => 'filters the plugin or user list',
+			'hide'        => 'changes error reporting %d time(s)',
+		);
+		foreach ( $map as $k => $t ) {
+			if ( ! empty( $f[ $k ] ) ) {
+				$parts[] = sprintf( $t, (int) $f[ $k ] );
+			}
+		}
+		return implode( ', ', $parts );
+	}
+
+	public static function trusted_hashes() {
+		$r = self::rules();
+		return isset( $r['trusted'] ) && is_array( $r['trusted'] ) ? array_flip( $r['trusted'] ) : array();
+	}
 
 	private static function deep_file( $rel ) {
 		$abs = self::abs( $rel );
@@ -1529,26 +1660,49 @@ final class MCSS_Scanner {
 		if ( ! $b || $b['score'] <= 0 ) {
 			return;
 		}
-		// Inside a plugin folder, big commercial plugins (page builders, importers, form builders) use eval and decoders for
-		// their own reasons, so the bar is higher there. Themes, mu-plugins, uploads, drop-ins and the site root are where
-		// malware actually lands, so the bar is lower.
+		$sha     = hash( 'sha256', $c );
+		$trusted = self::trusted_hashes();
+		if ( isset( $trusted[ $sha ] ) ) {
+			return; // vendor file verified by content and published in the signed rules
+		}
 		$plugins_rel = rtrim( self::rel( WP_PLUGIN_DIR ), '/' ) . '/';
 		$in_plugin   = self::under( $rel, $plugins_rel );
-		$high_at     = $in_plugin ? 13 : 7;
-		$medium_at   = $in_plugin ? 9 : 5;
-		if ( $b['score'] < $medium_at ) {
+		$slug        = '';
+		$where       = 'the site root';
+		if ( $in_plugin ) {
+			$slug  = substr( $rel, strlen( $plugins_rel ) );
+			$slug  = substr( $slug, 0, (int) strpos( $slug . '/', '/' ) );
+			$where = 'a plugin';
+		} elseif ( self::under( $rel, rtrim( self::rel( WPMU_PLUGIN_DIR ), '/' ) . '/' ) ) {
+			$where = 'must-use plugins';
+		} elseif ( self::under( $rel, rtrim( self::rel( get_theme_root() ), '/' ) . '/' ) ) {
+			$where = 'a theme';
+		} elseif ( self::under( $rel, self::uploads_rel() ) ) {
+			$where = 'uploads';
+		} elseif ( strpos( $rel, '/' ) !== false ) {
+			$where = 'wp-content';
+		}
+		$ctx = array(
+			'in_plugin'   => $in_plugin,
+			'plugin_real' => $in_plugin && self::plugin_looks_real( $slug ),
+			'where'       => $where,
+			'random_name' => (bool) preg_match( '~^[a-f0-9]{16,}\.php$|^[a-z]{1,3}\d{2,}[a-z0-9]{3,}\.php$~i', basename( $rel ) ),
+		);
+		list( $conf, $label, $why ) = self::confidence( $b, $ctx );
+		$medium_at = $in_plugin ? 9 : 5;
+		if ( $b['score'] < $medium_at && $conf < 40 ) {
 			return;
 		}
-		$sev = ( $b['sev'] === 'high' && $b['score'] >= $high_at ) ? 'high' : 'medium';
+		// Severity follows confidence, so the list reads consistently: what to act on now, what to read, what to glance at.
+		$sev = $conf >= 70 ? 'high' : ( $conf >= 40 ? 'medium' : 'low' );
 		if ( $in_plugin ) {
-			$slug = substr( $rel, strlen( $plugins_rel ) );
-			$slug = substr( $slug, 0, (int) strpos( $slug . '/', '/' ) );
 			self::$deep_counts[ $slug ] = isset( self::$deep_counts[ $slug ] ) ? self::$deep_counts[ $slug ] + 1 : 1;
 			if ( self::$deep_counts[ $slug ] > 4 && $sev !== 'high' ) {
-				return; // enough from this plugin
+				return;
 			}
 		}
-		self::add( $sev, 'behaviour', 'Code behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), $rel, 0, 'score ' . $b['score'] . ( $in_plugin ? ' (inside a plugin, higher bar applied)' : '' ), 'Found by behaviour analysis, not a signature. Read the file: page builders, importers and form plugins legitimately do some of these things.' );
+		$note = 'Confidence ' . $conf . '%: ' . $label . ' (below 40% is filed as low, 40 to 69 as medium, 70 and above as high). Because: ' . implode( '; ', $why ) . '. Counted: ' . self::behaviour_detail( $b['f'] ) . '. sha256 ' . $sha . '. Behaviour analysis reads what the code does, not what it is called; a legitimate connector or page builder that does these things looks the same to it, so read the file. If it is vendor code you trust, send the sha256 to be added to the trusted list in the signed rules and it will stop being reported on every site.';
+		self::add( $sev, 'behaviour', 'Code behaves like malware (' . $conf . '% confidence): ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), $rel, 0, 'score ' . $b['score'], $note );
 	}
 
 	/**
@@ -1562,14 +1716,16 @@ final class MCSS_Scanner {
 			foreach ( (array) $wpdb->get_results( "SELECT id, name, code, active, scope FROM {$sn} WHERE active = 1 LIMIT 200" ) as $r ) {
 				$b = self::behaviour( "<?php\n" . $r->code );
 				if ( $b && $b['score'] >= 5 ) {
-					self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Active Code Snippet "' . $r->name . '" behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:snippet ' . (int) $r->id, 0, self::clean_snip( substr( $r->code, 0, 200 ) ), 'Open Snippets in wp-admin and read it.', (string) $r->id );
+					list( $conf, $label, $why ) = self::confidence( $b, array( 'in_plugin' => false, 'where' => 'the database (a code snippet)' ) );
+					self::add( $conf >= 70 ? 'high' : ( $conf >= 40 ? 'medium' : 'low' ), 'behaviour_db', 'Active Code Snippet "' . $r->name . '" behaves like malware (' . $conf . '% confidence): ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:snippet ' . (int) $r->id, 0, self::clean_snip( substr( $r->code, 0, 200 ) ), 'Confidence ' . $conf . '%: ' . $label . '. Because: ' . implode( '; ', $why ) . '. Counted: ' . self::behaviour_detail( $b['f'] ) . '. Open Snippets in wp-admin and read it.', (string) $r->id );
 				}
 			}
 		}
 		foreach ( (array) $wpdb->get_results( "SELECT ID, post_title, post_content FROM {$wpdb->posts} WHERE post_type = 'wpcode' AND post_status = 'publish' LIMIT 200" ) as $r ) {
 			$b = self::behaviour( "<?php\n" . $r->post_content );
 			if ( $b && $b['score'] >= 5 ) {
-				self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Active WPCode snippet "' . $r->post_title . '" behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:post ' . (int) $r->ID, 0, self::clean_snip( substr( $r->post_content, 0, 200 ) ), 'Open Code Snippets (WPCode) in wp-admin and read it.' );
+				list( $conf, $label, $why ) = self::confidence( $b, array( 'in_plugin' => false, 'where' => 'the database (a WPCode snippet)' ) );
+				self::add( $conf >= 70 ? 'high' : ( $conf >= 40 ? 'medium' : 'low' ), 'behaviour_db', 'Active WPCode snippet "' . $r->post_title . '" behaves like malware (' . $conf . '% confidence): ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:post ' . (int) $r->ID, 0, self::clean_snip( substr( $r->post_content, 0, 200 ) ), 'Confidence ' . $conf . '%: ' . $label . '. Because: ' . implode( '; ', $why ) . '. Counted: ' . self::behaviour_detail( $b['f'] ) . '. Open Code Snippets (WPCode) in wp-admin and read it.' );
 			}
 		}
 		// Oxygen stores code block PHP base64 encoded inside its shortcode/JSON meta.
@@ -1583,7 +1739,8 @@ final class MCSS_Scanner {
 					}
 					$b = self::behaviour( strpos( $php, '<?' ) === false ? "<?php\n" . $php : $php );
 					if ( $b && $b['score'] >= 5 ) {
-						self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Oxygen code block on post ' . (int) $r->post_id . ' behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:postmeta ' . $r->meta_key . ' (post ' . (int) $r->post_id . ')', 0, self::clean_snip( substr( $php, 0, 200 ) ), 'Open the page in Oxygen and read the code block.', md5( $enc ) );
+						list( $conf, $label, $why ) = self::confidence( $b, array( 'in_plugin' => false, 'where' => 'the database (an Oxygen code block)' ) );
+						self::add( $conf >= 70 ? 'high' : ( $conf >= 40 ? 'medium' : 'low' ), 'behaviour_db', 'Oxygen code block on post ' . (int) $r->post_id . ' behaves like malware (' . $conf . '% confidence): ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:postmeta ' . $r->meta_key . ' (post ' . (int) $r->post_id . ')', 0, self::clean_snip( substr( $php, 0, 200 ) ), 'Confidence ' . $conf . '%: ' . $label . '. Because: ' . implode( '; ', $why ) . '. Counted: ' . self::behaviour_detail( $b['f'] ) . '. Open the page in Oxygen and read the code block.', md5( $enc ) );
 					}
 				}
 			}
