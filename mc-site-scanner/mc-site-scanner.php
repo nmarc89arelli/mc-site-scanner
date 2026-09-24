@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Relish Security
  * Description: Malware and integrity scanner, rendered-page and vulnerability checks, instant alerts, activity log, central reporting, one-click repair and quarantine, hardening switches and incident response tools. Scanning is read-only and runs in small timed batches. Anything that changes the site only runs when you press it, and is verified and rolled back if the site stops responding.
- * Version: 1.6.0
+ * Version: 1.7.0
  * Author: Marcarelli Consulting
  * Requires PHP: 7.4
  * Requires at least: 5.8
@@ -21,7 +21,7 @@ define( 'MCSS_PUBKEY', 'vzAz8wkky7UdR705tnIB8HYUgEqIUmVFjOuG9FAqDGw=' );
 
 final class MCSS_Scanner {
 
-	const VERSION      = '1.6.0';
+	const VERSION      = '1.7.0';
 	const OPT_STATE    = 'mcss_state';
 	const OPT_FINDINGS = 'mcss_findings';
 	const OPT_RUN      = 'mcss_findings_run';
@@ -340,7 +340,7 @@ final class MCSS_Scanner {
 		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name = 'mcss_lock'" );
 	}
 
-	public static function start( $mode ) {
+	public static function start( $mode, $deep = false ) {
 		self::cleanup_chunks( self::state() );
 		delete_transient( 'mcss_core_sums' );
 
@@ -360,6 +360,9 @@ final class MCSS_Scanner {
 		$state = array(
 			'id'              => substr( md5( uniqid( '', true ) ), 0, 8 ),
 			'mode'            => $mode,
+			'deep'            => (bool) $deep,
+			'work'            => 0.0,
+			'files_work'      => 0.0,
 			'phase'           => 'core',
 			'offset'          => 0,
 			'started'         => time(),
@@ -455,7 +458,7 @@ final class MCSS_Scanner {
 		}
 
 		// A scan begun by an older version of the plugin lacks the newer keys. Give them safe defaults.
-		$state += array( 'marker' => '', 'attempts' => 0, 'dir_stack' => null, 'symlinks' => 0, 'db_cur' => 0, 'db_max' => -1, 'db_seen' => 0, 'render_queue' => null, 'render_sum' => array(), 'render_domains' => array(), 'vuln_queue' => null, 'vuln_total' => 0 );
+		$state += array( 'deep' => false, 'work' => 0.0, 'files_work' => 0.0, 'marker' => '', 'attempts' => 0, 'dir_stack' => null, 'symlinks' => 0, 'db_cur' => 0, 'db_max' => -1, 'db_seen' => 0, 'render_queue' => null, 'render_sum' => array(), 'render_domains' => array(), 'vuln_queue' => null, 'vuln_total' => 0 );
 
 		$marker = self::marker( $state );
 		if ( $state['marker'] === $marker ) {
@@ -470,6 +473,7 @@ final class MCSS_Scanner {
 		self::save_state( $state );
 
 		$deadline = microtime( true ) + $budget;
+		$t0       = microtime( true );
 		self::load_findings();
 
 		while ( empty( $state['done'] ) && microtime( true ) < $deadline ) {
@@ -488,6 +492,9 @@ final class MCSS_Scanner {
 					case 'files':
 						$state = self::phase_files( $state, $deadline );
 						break;
+					case 'hooks':
+						$state = self::phase_hooks( $state );
+						break;
 					case 'db':
 						$state = self::phase_db( $state, $deadline );
 						break;
@@ -505,7 +512,7 @@ final class MCSS_Scanner {
 				}
 			} catch ( \Throwable $e ) {
 				$state['notes'][] = 'Phase "' . $phase . '" stopped early: ' . $e->getMessage();
-				$order            = array( 'core' => 'plugins', 'plugins' => 'list', 'list' => 'files', 'files' => 'db', 'db' => 'render', 'render' => 'vuln', 'vuln' => 'checks', 'checks' => 'finish' );
+				$order            = array( 'core' => 'plugins', 'plugins' => 'list', 'list' => 'files', 'files' => 'db', 'hooks' => 'db', 'db' => 'render', 'render' => 'vuln', 'vuln' => 'checks', 'checks' => 'finish' );
 				$state['phase']   = isset( $order[ $phase ] ) ? $order[ $phase ] : 'finish';
 				$state['offset']  = 0;
 			}
@@ -513,9 +520,38 @@ final class MCSS_Scanner {
 
 		$state['marker']   = '';
 		$state['attempts'] = 0;
+		$state['work']     = (float) $state['work'] + ( microtime( true ) - $t0 );
 		self::save_findings();
 		self::save_state( $state );
 		return $state;
+	}
+
+	public static function human_seconds( $s ) {
+		$s = (int) round( $s );
+		if ( $s < 60 ) {
+			return 'a minute';
+		}
+		if ( $s < 3600 ) {
+			return ( (int) ceil( $s / 60 ) ) . ' minutes';
+		}
+		return round( $s / 3600, 1 ) . ' hours';
+	}
+
+	/** Estimate for the next scan from the last one's measured rate. Returns array(seconds, files) or null. */
+	public static function estimate( $deep ) {
+		$l = get_option( self::OPT_LAST, array() );
+		if ( empty( $l['files'] ) || empty( $l['rate'] ) ) {
+			return null;
+		}
+		$per  = (float) $l['rate'];
+		$mult = 1.0;
+		if ( $deep && empty( $l['deep'] ) ) {
+			$mult = 3.2; // tokenising costs about this much more than pattern matching, measured on the test corpus
+		} elseif ( ! $deep && ! empty( $l['deep'] ) ) {
+			$mult = 1 / 3.2;
+		}
+		$overhead = 40 + ( ! empty( $l['render'] ) ? 20 : 0 );
+		return array( (int) ( $l['files'] * $per * $mult + $overhead ), (int) $l['files'] );
 	}
 
 	public static function progress( $state ) {
@@ -537,8 +573,16 @@ final class MCSS_Scanner {
 			case 'list':
 				return array( 'pct' => 26, 'label' => 'Building file list (' . number_format( (int) $state['total_files'] ) . ' files to scan so far)', 'done' => false );
 			case 'files':
-				$t = max( 1, (int) $state['total_files'] );
-				return array( 'pct' => 30 + (int) ( 58 * min( 1, $o / $t ) ), 'label' => 'Scanning files (' . number_format( $o ) . ' of ' . number_format( $t ) . ')', 'done' => false );
+				$t    = max( 1, (int) $state['total_files'] );
+				$eta  = '';
+				$work = (float) $state['files_work'];
+				if ( $o >= 200 && $work > 2 ) {
+					$left = ( $t - $o ) * ( $work / $o ) * 1.15 + 20; // remaining files at the measured rate, plus the phases after this one
+					$eta  = ', about ' . self::human_seconds( $left ) . ' left';
+				}
+				return array( 'pct' => 30 + (int) ( 58 * min( 1, $o / $t ) ), 'label' => ( ! empty( $state['deep'] ) ? 'Deep scanning files (' : 'Scanning files (' ) . number_format( $o ) . ' of ' . number_format( $t ) . $eta . ')', 'done' => false );
+			case 'hooks':
+				return array( 'pct' => 88, 'label' => 'Inspecting what is hooked into WordPress and code stored in the database', 'done' => false );
 			case 'db':
 				return array( 'pct' => 88 + (int) $state['db_step'], 'label' => 'Scanning database', 'done' => false );
 			case 'render':
@@ -947,6 +991,7 @@ final class MCSS_Scanner {
 	}
 
 	private static function phase_files( $state, $deadline ) {
+		$t_files     = microtime( true );
 		$total       = (int) $state['total_files'];
 		$i           = (int) $state['offset'];
 		$uploads_rel = self::uploads_rel();
@@ -962,13 +1007,17 @@ final class MCSS_Scanner {
 			}
 			try {
 				self::scan_file( $rel, $uploads_rel, $rules );
+				if ( ! empty( $state['deep'] ) ) {
+					self::deep_file( $rel );
+				}
 			} catch ( \Throwable $e ) {
 				continue;
 			}
 		}
-		$state['offset'] = $i;
+		$state['files_work'] = (float) $state['files_work'] + ( microtime( true ) - $t_files );
+		$state['offset']     = $i;
 		if ( $i >= $total ) {
-			$state['phase']  = 'db';
+			$state['phase']  = ! empty( $state['deep'] ) ? 'hooks' : 'db';
 			$state['offset'] = 0;
 		}
 		return $state;
@@ -1232,6 +1281,436 @@ final class MCSS_Scanner {
 			$state['inventory']['domains'] = $state['domains'];
 			$state['phase']                = 'render';
 		}
+		return $state;
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Deep scan: behaviour analysis of PHP (what the code does, not what it says)
+	 * ------------------------------------------------------------------- */
+
+	private static function entropy( $s ) {
+		$len = strlen( $s );
+		if ( $len < 32 ) {
+			return 0.0;
+		}
+		$h = 0.0;
+		foreach ( count_chars( $s, 1 ) as $n ) {
+			$p  = $n / $len;
+			$h -= $p * log( $p, 2 );
+		}
+		return $h;
+	}
+
+	/**
+	 * Tokenise a PHP source and tally behaviours. Returns null for files that are not PHP or cannot be tokenised.
+	 * Every behaviour is something malware needs to do; legitimate code does some of them too, so the score comes from
+	 * the combinations, and the strongest combinations set the severity.
+	 */
+	public static function behaviour( $content ) {
+		if ( strpos( $content, '<?' ) === false ) {
+			return null;
+		}
+		try {
+			$tokens = @token_get_all( $content );
+		} catch ( \Throwable $e ) {
+			return null;
+		}
+		if ( ! is_array( $tokens ) || count( $tokens ) < 5 ) {
+			return null;
+		}
+		$inputs   = array( '$_get' => 1, '$_post' => 1, '$_request' => 1, '$_cookie' => 1, '$_files' => 1 );
+		$decoders = array( 'base64_decode' => 1, 'gzinflate' => 1, 'gzuncompress' => 1, 'gzdecode' => 1, 'str_rot13' => 1, 'hex2bin' => 1, 'convert_uudecode' => 1, 'strrev' => 1, 'rawurldecode' => 1 );
+		$execs    = array( 'assert' => 1, 'system' => 1, 'exec' => 1, 'shell_exec' => 1, 'passthru' => 1, 'proc_open' => 1, 'popen' => 1, 'create_function' => 1, 'pcntl_exec' => 1 );
+		$writes   = array( 'file_put_contents' => 1, 'fwrite' => 1, 'fputs' => 1, 'move_uploaded_file' => 1, 'chmod' => 1, 'touch' => 1, 'symlink' => 1 );
+		$net      = array( 'curl_exec' => 1, 'curl_init' => 1, 'fsockopen' => 1, 'wp_remote_get' => 1, 'wp_remote_post' => 1, 'wp_remote_request' => 1, 'stream_socket_client' => 1 );
+		$auth     = array( 'wp_set_auth_cookie' => 1, 'wp_set_current_user' => 1, 'wp_insert_user' => 1, 'wp_create_user' => 1, 'wp_update_user' => 1 );
+		$hide     = array( 'error_reporting' => 1, 'ini_set' => 1, 'set_error_handler' => 1 );
+		$f        = array( 'input' => 0, 'decode' => 0, 'exec' => 0, 'eval' => 0, 'varfunc' => 0, 'built' => 0, 'chr' => 0, 'write' => 0, 'net' => 0, 'auth' => 0, 'hide' => 0, 'inject' => 0, 'hideplugin' => 0, 'include_var' => 0, 'longlit' => 0, 'code' => 0, 'comment' => 0, 'lines' => 0, 'server_in' => 0, 'rawinput' => 0 );
+		$n        = count( $tokens );
+		$prev_str = 0;
+
+		for ( $i = 0; $i < $n; $i++ ) {
+			$t = $tokens[ $i ];
+			if ( ! is_array( $t ) ) {
+				if ( $t === '.' ) {
+					continue;
+				}
+				$prev_str = 0;
+				continue;
+			}
+			list( $id, $text ) = $t;
+			$f['lines'] = max( $f['lines'], $t[2] );
+			if ( $id === T_COMMENT || $id === T_DOC_COMMENT ) {
+				$f['comment'] += strlen( $text );
+				continue;
+			}
+			if ( $id === T_WHITESPACE || $id === T_INLINE_HTML || $id === T_OPEN_TAG || $id === T_CLOSE_TAG ) {
+				if ( $id === T_INLINE_HTML && stripos( $text, '<script' ) !== false ) {
+					$f['inject']++;
+				}
+				continue;
+			}
+			$f['code'] += strlen( $text );
+			$low = strtolower( $text );
+
+			if ( $id === T_EVAL ) {
+				$f['eval']++;
+			} elseif ( $id === T_INCLUDE || $id === T_INCLUDE_ONCE || $id === T_REQUIRE || $id === T_REQUIRE_ONCE ) {
+				$j = $i + 1;
+				while ( $j < $n && is_array( $tokens[ $j ] ) && $tokens[ $j ][0] === T_WHITESPACE ) {
+					$j++;
+				}
+				if ( $j < $n && ( $tokens[ $j ] === '(' ) ) {
+					$j++;
+					while ( $j < $n && is_array( $tokens[ $j ] ) && $tokens[ $j ][0] === T_WHITESPACE ) {
+						$j++;
+					}
+				}
+				if ( $j < $n && is_array( $tokens[ $j ] ) && ( $tokens[ $j ][0] === T_VARIABLE || $tokens[ $j ][0] === T_STRING && in_array( strtolower( $tokens[ $j ][1] ), array_keys( $decoders ), true ) ) ) {
+					$f['include_var']++;
+				}
+			} elseif ( $id === T_VARIABLE ) {
+				if ( isset( $inputs[ $low ] ) ) {
+					$f['input']++;
+				} elseif ( $low === '$_server' ) {
+					$f['server_in']++;
+				}
+				// $name( ... ) : function called through a variable
+				$j = $i + 1;
+				while ( $j < $n && is_array( $tokens[ $j ] ) && $tokens[ $j ][0] === T_WHITESPACE ) {
+					$j++;
+				}
+				if ( $j < $n && $tokens[ $j ] === '(' && ! isset( $inputs[ $low ] ) ) {
+					$f['varfunc']++;
+				}
+			} elseif ( $id === T_STRING ) {
+				$k = $i - 1;
+				while ( $k >= 0 && is_array( $tokens[ $k ] ) && $tokens[ $k ][0] === T_WHITESPACE ) {
+					$k--;
+				}
+				$pt = $k >= 0 && is_array( $tokens[ $k ] ) ? $tokens[ $k ][0] : null;
+				if ( $pt === T_OBJECT_OPERATOR || $pt === T_DOUBLE_COLON || $pt === T_FUNCTION || $pt === T_NS_SEPARATOR && false || ( defined( 'T_NULLSAFE_OBJECT_OPERATOR' ) && $pt === T_NULLSAFE_OBJECT_OPERATOR ) ) {
+					$prev_str = 0;
+					continue;
+				}
+				$j = $i + 1;
+				while ( $j < $n && is_array( $tokens[ $j ] ) && $tokens[ $j ][0] === T_WHITESPACE ) {
+					$j++;
+				}
+				if ( ! ( $j < $n && $tokens[ $j ] === '(' ) ) {
+					$prev_str = 0;
+					continue; // a name that is not being called
+				}
+				if ( isset( $decoders[ $low ] ) ) {
+					$f['decode']++;
+				} elseif ( isset( $execs[ $low ] ) ) {
+					$f['exec']++;
+				} elseif ( isset( $writes[ $low ] ) ) {
+					$f['write']++;
+				} elseif ( isset( $net[ $low ] ) ) {
+					$f['net']++;
+				} elseif ( isset( $auth[ $low ] ) ) {
+					$f['auth']++;
+				} elseif ( isset( $hide[ $low ] ) ) {
+					$f['hide']++;
+				} elseif ( $low === 'chr' ) {
+					$f['chr']++;
+				} elseif ( $low === 'getallheaders' ) {
+					$f['input']++;
+				} elseif ( $low === 'call_user_func' || $low === 'call_user_func_array' ) {
+					$f['varfunc']++;
+				}
+			} elseif ( $id === T_CONSTANT_ENCAPSED_STRING ) {
+				$len = strlen( $text ) - 2;
+				$lit = strtolower( trim( $text, '"\'' ) );
+				if ( $lit === 'php://input' ) {
+					$f['rawinput']++;
+				} elseif ( $lit === 'all_plugins' || $lit === 'pre_user_query' ) {
+					$f['hideplugin']++;
+				} elseif ( $lit === 'wp_head' || $lit === 'wp_footer' || $lit === 'wp_body_open' ) {
+					$f['inject']++;
+				}
+				if ( $len >= 400 ) {
+					$e = self::entropy( substr( $text, 1, -1 ) );
+					if ( $e > 5.2 && ! preg_match( '~^["\'](?:data:image|<svg|<\?xml)~i', $text ) ) {
+						$f['longlit']++;
+					}
+				}
+				if ( $len > 0 && $len <= 4 ) {
+					$prev_str++;
+					if ( $prev_str === 3 ) {
+						$f['built']++; // 'ba' . 'se' . '64' ...
+					}
+					continue;
+				}
+			}
+			$prev_str = 0;
+		}
+
+		$reasons = array();
+		$score   = 0;
+		$max     = 'none';
+		$add     = function ( $pts, $why, $sev = 'medium' ) use ( &$score, &$reasons, &$max ) {
+			$score    += $pts;
+			$reasons[] = $why;
+			if ( $sev === 'high' ) {
+				$max = 'high';
+			} elseif ( $max !== 'high' && $sev === 'medium' ) {
+				$max = 'medium';
+			}
+		};
+		$input  = $f['input'] + $f['rawinput'];
+		$hidden = $f['hideplugin'] || $f['built'] || $f['chr'] >= 8;
+		if ( $input && $f['eval'] ) {
+			$add( 8, 'evaluates code and reads request input', 'high' );
+		} elseif ( $input && $f['exec'] ) {
+			$add( 6, 'runs system commands and reads request input', 'high' );
+		}
+		if ( $f['decode'] && $f['eval'] ) {
+			$add( 7, 'evaluates decoded data', 'high' );
+		}
+		if ( $f['built'] && $f['varfunc'] >= 2 ) {
+			$add( 8, 'function names assembled from string fragments and then called', 'high' );
+		} elseif ( $f['built'] >= 2 ) {
+			$add( 3, 'function names assembled from string fragments', 'low' );
+		}
+		if ( $f['longlit'] && ( $f['eval'] || $f['exec'] ) ) {
+			$add( 7, 'long high-entropy string literal alongside eval or exec', 'high' );
+		} elseif ( $f['longlit'] && $f['decode'] && $f['varfunc'] ) {
+			$add( 4, 'long high-entropy string literal with a decoder and variable calls', 'medium' );
+		}
+		if ( $f['auth'] && $input ) {
+			$strong = $hidden || $f['decode'] || $f['net'];
+			$add( $strong ? 7 : 5, 'sets login state based on request input' . ( $strong ? ' while also ' . ( $hidden ? 'hiding itself' : ( $f['decode'] ? 'decoding data' : 'talking to a remote server' ) ) : '' ), $strong ? 'high' : 'medium' );
+		}
+		if ( $f['hideplugin'] && ( $f['net'] || $f['auth'] || $f['inject'] ) ) {
+			$add( 6, 'hides itself from the plugin or user list while doing network, login or output work', 'high' );
+		}
+		if ( $f['inject'] && $f['net'] && $input ) {
+			$add( $hidden ? 6 : 3, 'injects output into pages, talks to a remote server and reads request input', $hidden ? 'high' : 'medium' );
+		}
+		if ( $f['include_var'] && ( $f['decode'] || $f['built'] ) ) {
+			$add( 5, 'includes a file whose path is decoded or assembled', 'medium' );
+		}
+		if ( $f['varfunc'] >= 3 && $f['decode'] && $input ) {
+			$add( 5, 'calls functions through variables with a decoder and request input', 'medium' );
+		}
+		if ( $f['chr'] >= 8 && ( $f['varfunc'] || $f['eval'] ) ) {
+			$add( 5, 'builds strings from character codes and calls the result', 'medium' );
+		}
+		if ( $f['write'] && $input && $f['decode'] ) {
+			$add( 4, 'writes decoded request input to a file', 'medium' );
+		}
+		if ( $f['hide'] >= 2 && $f['eval'] ) {
+			$add( 3, 'suppresses errors around eval', 'low' );
+		}
+		if ( $f['lines'] > 0 && $f['code'] / max( 1, $f['lines'] ) > 400 && $f['eval'] ) {
+			$add( 3, 'very long lines (packed code) with eval', 'low' );
+		}
+		return array( 'score' => $score, 'sev' => $max, 'reasons' => $reasons, 'f' => $f );
+	}
+
+	private static $deep_counts = array();
+
+	private static function deep_file( $rel ) {
+		$abs = self::abs( $rel );
+		if ( ! self::is_php_ext( self::ext( $rel ) ) || ! is_file( $abs ) ) {
+			return;
+		}
+		$size = (int) @filesize( $abs );
+		if ( $size < 40 || $size > 3000000 ) {
+			return;
+		}
+		$c = @file_get_contents( $abs );
+		if ( ! is_string( $c ) ) {
+			return;
+		}
+		$b = self::behaviour( $c );
+		if ( ! $b || $b['score'] <= 0 ) {
+			return;
+		}
+		// Inside a plugin folder, big commercial plugins (page builders, importers, form builders) use eval and decoders for
+		// their own reasons, so the bar is higher there. Themes, mu-plugins, uploads, drop-ins and the site root are where
+		// malware actually lands, so the bar is lower.
+		$plugins_rel = rtrim( self::rel( WP_PLUGIN_DIR ), '/' ) . '/';
+		$in_plugin   = self::under( $rel, $plugins_rel );
+		$high_at     = $in_plugin ? 13 : 7;
+		$medium_at   = $in_plugin ? 9 : 5;
+		if ( $b['score'] < $medium_at ) {
+			return;
+		}
+		$sev = ( $b['sev'] === 'high' && $b['score'] >= $high_at ) ? 'high' : 'medium';
+		if ( $in_plugin ) {
+			$slug = substr( $rel, strlen( $plugins_rel ) );
+			$slug = substr( $slug, 0, (int) strpos( $slug . '/', '/' ) );
+			self::$deep_counts[ $slug ] = isset( self::$deep_counts[ $slug ] ) ? self::$deep_counts[ $slug ] + 1 : 1;
+			if ( self::$deep_counts[ $slug ] > 4 && $sev !== 'high' ) {
+				return; // enough from this plugin
+			}
+		}
+		self::add( $sev, 'behaviour', 'Code behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), $rel, 0, 'score ' . $b['score'] . ( $in_plugin ? ' (inside a plugin, higher bar applied)' : '' ), 'Found by behaviour analysis, not a signature. Read the file: page builders, importers and form plugins legitimately do some of these things.' );
+	}
+
+	/**
+	 * Code stored in the database: Code Snippets, WPCode, Oxygen code blocks. Decoded and put through the same analysis.
+	 */
+	private static function deep_db_code( &$state ) {
+		global $wpdb;
+		$old = $wpdb->suppress_errors( true );
+		$sn  = $wpdb->prefix . 'snippets';
+		if ( $wpdb->get_var( $wpdb->prepare( 'SHOW TABLES LIKE %s', $sn ) ) === $sn ) {
+			foreach ( (array) $wpdb->get_results( "SELECT id, name, code, active, scope FROM {$sn} WHERE active = 1 LIMIT 200" ) as $r ) {
+				$b = self::behaviour( "<?php\n" . $r->code );
+				if ( $b && $b['score'] >= 5 ) {
+					self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Active Code Snippet "' . $r->name . '" behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:snippet ' . (int) $r->id, 0, self::clean_snip( substr( $r->code, 0, 200 ) ), 'Open Snippets in wp-admin and read it.', (string) $r->id );
+				}
+			}
+		}
+		foreach ( (array) $wpdb->get_results( "SELECT ID, post_title, post_content FROM {$wpdb->posts} WHERE post_type = 'wpcode' AND post_status = 'publish' LIMIT 200" ) as $r ) {
+			$b = self::behaviour( "<?php\n" . $r->post_content );
+			if ( $b && $b['score'] >= 5 ) {
+				self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Active WPCode snippet "' . $r->post_title . '" behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:post ' . (int) $r->ID, 0, self::clean_snip( substr( $r->post_content, 0, 200 ) ), 'Open Code Snippets (WPCode) in wp-admin and read it.' );
+			}
+		}
+		// Oxygen stores code block PHP base64 encoded inside its shortcode/JSON meta.
+		$rows = $wpdb->get_results( $wpdb->prepare( "SELECT post_id, meta_key, meta_value FROM {$wpdb->postmeta} WHERE meta_key IN ('ct_builder_shortcodes','ct_builder_json','_oxygen_data') AND meta_value LIKE %s LIMIT 300", '%' . $wpdb->esc_like( 'code_php' ) . '%' ) );
+		foreach ( (array) $rows as $r ) {
+			if ( preg_match_all( '~code_php["\']?\s*[:=]\s*["\']([A-Za-z0-9+/=\\\\]{40,})["\']~', $r->meta_value, $m ) ) {
+				foreach ( array_slice( $m[1], 0, 20 ) as $enc ) {
+					$php = base64_decode( str_replace( '\\/', '/', $enc ), true );
+					if ( ! is_string( $php ) || $php === '' ) {
+						continue;
+					}
+					$b = self::behaviour( strpos( $php, '<?' ) === false ? "<?php\n" . $php : $php );
+					if ( $b && $b['score'] >= 5 ) {
+						self::add( $b['sev'] === 'high' ? 'high' : 'medium', 'behaviour_db', 'Oxygen code block on post ' . (int) $r->post_id . ' behaves like malware: ' . implode( '; ', array_slice( $b['reasons'], 0, 3 ) ), 'db:postmeta ' . $r->meta_key . ' (post ' . (int) $r->post_id . ')', 0, self::clean_snip( substr( $php, 0, 200 ) ), 'Open the page in Oxygen and read the code block.', md5( $enc ) );
+					}
+				}
+			}
+		}
+		$wpdb->suppress_errors( $old );
+	}
+
+	/* ---------------------------------------------------------------------
+	 * Deep scan: what is hooked into WordPress right now, and where it lives
+	 * ------------------------------------------------------------------- */
+
+	private static function callback_origin( $cb ) {
+		try {
+			if ( $cb instanceof \Closure ) {
+				$r = new \ReflectionFunction( $cb );
+			} elseif ( is_string( $cb ) && strpos( $cb, '::' ) !== false ) {
+				$r = new \ReflectionMethod( $cb );
+			} elseif ( is_string( $cb ) ) {
+				if ( ! function_exists( $cb ) ) {
+					return array( 'missing function ' . $cb, '', 0 );
+				}
+				$r = new \ReflectionFunction( $cb );
+			} elseif ( is_array( $cb ) && count( $cb ) === 2 ) {
+				$r = new \ReflectionMethod( $cb[0], $cb[1] );
+			} elseif ( is_object( $cb ) && method_exists( $cb, '__invoke' ) ) {
+				$r = new \ReflectionMethod( $cb, '__invoke' );
+			} else {
+				return array( 'unknown', '', 0 );
+			}
+			$name = $r instanceof \ReflectionMethod ? $r->class . '::' . $r->name : $r->name;
+			if ( $r->isInternal() ) {
+				return array( $name, '[internal]', 0 );
+			}
+			return array( $name, (string) $r->getFileName(), (int) $r->getStartLine() );
+		} catch ( \Throwable $e ) {
+			return array( 'unresolvable', '', 0 );
+		}
+	}
+
+	private static function phase_hooks( $state ) {
+		global $wp_filter;
+		$hooks = apply_filters( 'mcss_watched_hooks', array( 'wp_head', 'wp_footer', 'wp_body_open', 'init', 'plugins_loaded', 'wp_loaded', 'template_redirect', 'wp', 'shutdown', 'the_content', 'wp_enqueue_scripts', 'login_init', 'login_head', 'admin_init', 'pre_user_query', 'all_plugins', 'send_headers', 'setup_theme', 'after_setup_theme', 'wp_authenticate', 'authenticate', 'set_current_user', 'muplugins_loaded', 'rest_api_init', 'wp_ajax_nopriv_heartbeat', 'template_include', 'option_active_plugins', 'pre_option_active_plugins' ) );
+		$verified   = self::load_verified( $state );
+		$root       = rtrim( self::norm( ABSPATH ), '/' );
+		$content    = self::norm( WP_CONTENT_DIR );
+		$plugins    = self::norm( WP_PLUGIN_DIR );
+		$mu         = self::norm( WPMU_PLUGIN_DIR );
+		$themes     = self::norm( get_theme_root() );
+		$uploads    = self::norm( wp_upload_dir( null, false )['basedir'] );
+		$own        = self::norm( MCSS_FILE );
+		$inv        = array();
+		$seen       = array();
+		foreach ( $hooks as $hook ) {
+			if ( ! isset( $wp_filter[ $hook ] ) || ! is_object( $wp_filter[ $hook ] ) ) {
+				continue;
+			}
+			foreach ( $wp_filter[ $hook ]->callbacks as $prio => $cbs ) {
+				foreach ( $cbs as $cb ) {
+					if ( ! isset( $cb['function'] ) ) {
+						continue;
+					}
+					list( $name, $file, $line ) = self::callback_origin( $cb['function'] );
+					$file = self::norm( $file );
+					if ( $file === $own || $file === '[internal]' ) {
+						continue;
+					}
+					$key = $hook . '|' . $name . '|' . $file;
+					if ( isset( $seen[ $key ] ) ) {
+						continue;
+					}
+					$seen[ $key ] = 1;
+					$where = 'other';
+					if ( $file === '' || strpos( $file, "eval()'d code" ) !== false || strpos( $file, 'runtime-created' ) !== false ) {
+						$where = 'eval';
+					} elseif ( strpos( $file, $mu . '/' ) === 0 ) {
+						$where = 'mu-plugin';
+					} elseif ( strpos( $file, $plugins . '/' ) === 0 ) {
+						$where = 'plugin';
+					} elseif ( strpos( $file, $themes . '/' ) === 0 ) {
+						$where = 'theme';
+					} elseif ( strpos( $file, $uploads . '/' ) === 0 ) {
+						$where = 'uploads';
+					} elseif ( strpos( $file, $root . '/wp-includes/' ) === 0 || strpos( $file, $root . '/wp-admin/' ) === 0 ) {
+						$where = 'core';
+					} elseif ( dirname( $file ) === $content ) {
+						$where = 'drop-in';
+					}
+					$rel = self::rel( $file );
+					$ok  = isset( $verified[ $rel ] );
+					if ( count( $inv ) < 400 ) {
+						$inv[] = array( 'hook' => $hook, 'cb' => $name, 'file' => $rel !== '' ? $rel . ( $line ? ':' . $line : '' ) : $file, 'where' => $where, 'verified' => $ok );
+					}
+					if ( $where === 'eval' ) {
+						self::add( 'high', 'hook_eval', 'Code attached to "' . $hook . '" was created at runtime (eval or create_function), so no file on disk contains it', 'hook:' . $hook, 0, $name, 'Something on this site evaluates code from a string or the database. The deep scan\'s database checks and the behaviour findings show where.', $name );
+					} elseif ( $where === 'uploads' ) {
+						self::add( 'high', 'hook_uploads', 'Code attached to "' . $hook . '" lives inside the uploads folder', $rel, $line, $name );
+					} elseif ( $where === 'other' && $file !== '' ) {
+						self::add( 'medium', 'hook_outside', 'Code attached to "' . $hook . '" lives outside WordPress, plugins and themes', $rel, $line, $name, 'Legitimate for some hosts (their platform code is included from outside the site). Confirm you know what this file is.', $name );
+					} elseif ( in_array( $hook, array( 'all_plugins', 'pre_user_query', 'option_active_plugins', 'pre_option_active_plugins' ), true ) && ! $ok ) {
+						self::add( 'medium', 'hook_hiding', 'Unverified code filters "' . $hook . '", which can hide plugins or users', $rel, $line, $name, 'User Switching, membership and multisite tools do this legitimately. Anything else deserves a look.', $name );
+					}
+				}
+			}
+		}
+		$state['inventory']['hooks'] = $inv;
+
+		// Cron events whose hook has no listener: leftovers, or a listener that only exists sometimes.
+		$cron   = get_option( 'cron' );
+		$orphan = array();
+		if ( is_array( $cron ) ) {
+			foreach ( $cron as $ts => $set ) {
+				if ( ! is_array( $set ) ) {
+					continue;
+				}
+				foreach ( $set as $hook => $ev ) {
+					if ( ! has_action( $hook ) && count( $orphan ) < 40 && ! isset( $orphan[ $hook ] ) ) {
+						$orphan[ $hook ] = 1;
+					}
+				}
+			}
+		}
+		if ( ! empty( $orphan ) ) {
+			self::add( 'low', 'cron_orphan', count( $orphan ) . ' scheduled event(s) have nothing listening to them', 'db:option cron', 0, implode( ', ', array_keys( $orphan ) ), 'Usually left behind by removed plugins. Malware also schedules its own hooks; look for names you do not recognise.', md5( implode( ',', array_keys( $orphan ) ) ) );
+		}
+
+		self::deep_db_code( $state );
+		$state['phase'] = 'checks';
 		return $state;
 	}
 
@@ -1539,6 +2018,8 @@ final class MCSS_Scanner {
 				'duration'  => time() - (int) $state['started'],
 				'mode'      => $state['mode'],
 				'files'     => (int) $state['total_files'],
+				'rate'      => (int) $state['total_files'] > 0 ? (float) $state['files_work'] / (int) $state['total_files'] : 0,
+				'deep'      => ! empty( $state['deep'] ),
 				'counts'    => $counts,
 				'inventory' => $state['inventory'],
 				'notes'     => $state['notes'],
@@ -1645,7 +2126,7 @@ final class MCSS_Scanner {
 			wp_send_json_error( array( 'message' => 'A scan step is still running. Try again in a few seconds.' ) );
 		}
 		wp_clear_scheduled_hook( 'mcss_continue' );
-		$state = self::start( 'manual' );
+		$state = self::start( 'manual', ! empty( $_POST['deep'] ) );
 		self::unlock();
 		wp_send_json_success( self::progress( $state ) );
 	}
@@ -5024,18 +5505,25 @@ final class MCSS_Admin {
 					<span><strong><?php echo (int) $last['counts']['medium']; ?></strong> medium</span>
 					<span><strong><?php echo (int) $last['counts']['low']; ?></strong> low</span>
 				</p>
-				<p>Last scan finished <?php echo esc_html( wp_date( 'M j, Y g:i a', (int) $last['finished'] ) ); ?>. <?php echo esc_html( number_format( (int) $last['files'] ) ); ?> unverified files pattern-scanned in <?php echo (int) $last['duration']; ?> seconds (<?php echo esc_html( $last['mode'] ); ?>).</p>
+				<p>Last scan finished <?php echo esc_html( wp_date( 'M j, Y g:i a', (int) $last['finished'] ) ); ?>. <?php echo esc_html( number_format( (int) $last['files'] ) ); ?> unverified files pattern-scanned in <?php echo (int) $last['duration']; ?> seconds (<?php echo esc_html( $last['mode'] ); ?><?php echo ! empty( $last['deep'] ) ? ', deep' : ''; ?>).</p>
 			<?php else : ?>
 				<p>No scan has been run yet.</p>
 			<?php endif; ?>
 			<p>
-				<button class="button button-primary" id="mcss-run"><?php echo $running ? 'Resume scan' : 'Run scan'; ?></button>
+				<?php $est_q = MCSS_Scanner::estimate( false ); $est_d = MCSS_Scanner::estimate( true ); ?>
+				<button class="button button-primary" id="mcss-run" data-deep="0"><?php echo $running ? 'Resume scan' : 'Run scan'; ?></button>
+				<?php if ( ! $running ) : ?>
+					<button class="button" id="mcss-run-deep" data-deep="1">Deep scan</button>
+				<?php endif; ?>
+				<?php if ( ! $running && $est_q ) : ?>
+					<span class="description" style="margin-left:8px">Estimated: quick about <?php echo esc_html( MCSS_Scanner::human_seconds( $est_q[0] ) ); ?>, deep about <?php echo esc_html( MCSS_Scanner::human_seconds( $est_d[0] ) ); ?>, for <?php echo esc_html( number_format( $est_q[1] ) ); ?> unverified files.</span>
+				<?php endif; ?>
 				<?php if ( ! empty( $last['finished'] ) ) : ?>
 					<a class="button" href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=mcss_report' ), 'mcss_report' ) ); ?>">Download report</a>
 				<?php endif; ?>
 			</p>
 			<div id="mcss-progress" style="display:none"><div class="bar"><i></i></div><p id="mcss-label"></p></div>
-			<p class="description">Scanning only reads. Work is done in 6 second batches, so you can leave this page and resume later.</p>
+			<p class="description">Scanning only reads. Work is done in 6 second batches, so you can leave this page and resume later. A deep scan adds behaviour analysis of every unverified PHP file (what the code does rather than what it says), checks code stored in the database by Code Snippets, WPCode and Oxygen, and lists everything hooked into WordPress with the file it comes from. It takes roughly three times as long.</p>
 		</div>
 
 		<?php if ( ! empty( $last['notes'] ) ) : ?>
@@ -5123,6 +5611,15 @@ final class MCSS_Admin {
 				<?php endforeach; ?>
 				</tbody></table>
 			</details>
+			<?php if ( ! empty( $inv['hooks'] ) ) : ?>
+			<details><summary>Hooked into WordPress (<?php echo count( $inv['hooks'] ); ?> callbacks on watched hooks, from the deep scan)</summary>
+				<table class="widefat striped"><thead><tr><th>Hook</th><th>Callback</th><th>File</th><th>Where</th><th>Verified</th></tr></thead><tbody>
+				<?php foreach ( $inv['hooks'] as $h ) : ?>
+					<tr><td><?php echo esc_html( $h['hook'] ); ?></td><td><code><?php echo esc_html( $h['cb'] ); ?></code></td><td><code><?php echo esc_html( $h['file'] ); ?></code></td><td><?php echo esc_html( $h['where'] ); ?></td><td><?php echo $h['verified'] ? 'Yes' : ''; ?></td></tr>
+				<?php endforeach; ?>
+				</tbody></table>
+			</details>
+			<?php endif; ?>
 			<details><summary>Plugin verification</summary>
 				<table class="widefat striped"><thead><tr><th>Plugin</th><th>Result</th></tr></thead><tbody>
 				<?php
@@ -5370,7 +5867,7 @@ final class MCSS_Admin {
 				var body = new URLSearchParams(Object.assign({action: action, nonce: nonce}, extra || {}));
 				return fetch(ajax, {method: 'POST', credentials: 'same-origin', body: body}).then(function(r){ return r.json(); });
 			}
-			var btn = document.getElementById('mcss-run');
+			var btn = document.getElementById('mcss-run'), btnDeep = document.getElementById('mcss-run-deep');
 			if (btn) {
 				var box = document.getElementById('mcss-progress'), bar = box.querySelector('i'), label = document.getElementById('mcss-label'), fails = 0;
 				var show = function(p){ bar.style.width = (p.pct || 0) + '%'; label.textContent = p.label || ''; };
@@ -5386,13 +5883,15 @@ final class MCSS_Admin {
 						setTimeout(loop, 4000);
 					});
 				};
-				btn.addEventListener('click', function(e){
-					e.preventDefault(); btn.disabled = true; box.style.display = 'block';
+				var startScan = function(e, deep){
+					e.preventDefault(); btn.disabled = true; if (btnDeep) { btnDeep.disabled = true; } box.style.display = 'block';
 					if (resume) { label.textContent = 'Resuming'; loop(); return; }
-					label.textContent = 'Starting';
-					post('mcss_start').then(function(res){ if (res && res.success) { show(res.data); loop(); } else { label.textContent = 'Could not start the scan.'; btn.disabled = false; } })
+					label.textContent = deep ? 'Starting deep scan' : 'Starting';
+					post('mcss_start', deep ? {deep: 1} : {}).then(function(res){ if (res && res.success) { show(res.data); loop(); } else { label.textContent = 'Could not start the scan.'; btn.disabled = false; } })
 						.catch(function(){ label.textContent = 'Could not start the scan.'; btn.disabled = false; });
-				});
+				};
+				btn.addEventListener('click', function(e){ startScan(e, false); });
+				if (btnDeep) { btnDeep.addEventListener('click', function(e){ startScan(e, true); }); }
 			}
 			var actMsg = document.getElementById('mcss-act-msg');
 			document.querySelectorAll('.mcss-act').forEach(function(b){
@@ -5443,7 +5942,7 @@ register_deactivation_hook( __FILE__, array( 'MCSS_Scanner', 'deactivate' ) );
 
 if ( defined( 'WP_CLI' ) && WP_CLI ) {
 	/**
-	 * wp mcss scan [--format=text|json]
+	 * wp mcss scan [--deep] [--format=text|json]
 	 */
 	WP_CLI::add_command(
 		'mcss scan',
@@ -5451,7 +5950,7 @@ if ( defined( 'WP_CLI' ) && WP_CLI ) {
 			if ( ! MCSS_Scanner::lock() ) {
 				WP_CLI::error( 'Another scan step is running. Try again in a minute.' );
 			}
-			MCSS_Scanner::start( 'cli' );
+			MCSS_Scanner::start( 'cli', ! empty( $assoc['deep'] ) );
 			$lastlabel = '';
 			$loops     = 0;
 			do {
