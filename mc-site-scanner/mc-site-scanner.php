@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Relish Security
  * Description: Malware and integrity scanner, rendered-page and vulnerability checks, instant alerts, activity log, central reporting, one-click repair and quarantine, hardening switches and incident response tools. Scanning is read-only and runs in small timed batches. Anything that changes the site only runs when you press it, and is verified and rolled back if the site stops responding.
- * Version: 1.7.1
+ * Version: 1.7.2
  * Author: Marcarelli Consulting
  * Requires PHP: 7.4
  * Requires at least: 5.8
@@ -21,7 +21,7 @@ define( 'MCSS_PUBKEY', 'vzAz8wkky7UdR705tnIB8HYUgEqIUmVFjOuG9FAqDGw=' );
 
 final class MCSS_Scanner {
 
-	const VERSION      = '1.7.1';
+	const VERSION      = '1.7.2';
 	const OPT_STATE    = 'mcss_state';
 	const OPT_FINDINGS = 'mcss_findings';
 	const OPT_RUN      = 'mcss_findings_run';
@@ -5391,6 +5391,265 @@ final class MCSS_Update {
 }
 
 /* =========================================================================
+ * File viewer: read-only, with the finding and every rule hit highlighted
+ * ======================================================================= */
+
+final class MCSS_Viewer {
+
+	const MAX = 2000000;
+
+	private static function official_copy( $f ) {
+		$rel = $f['path'];
+		if ( $f['rule'] === 'core_modified' ) {
+			$wp_version = '';
+			include ABSPATH . WPINC . '/version.php';
+			$url = 'https://core.svn.wordpress.org/tags/' . rawurlencode( $wp_version ) . '/' . str_replace( '%2F', '/', rawurlencode( $rel ) );
+		} elseif ( $f['rule'] === 'plugin_modified' ) {
+			$plugins_rel = rtrim( MCSS_Scanner::rel( WP_PLUGIN_DIR ), '/' ) . '/';
+			$rest        = substr( $rel, strlen( $plugins_rel ) );
+			$slug        = substr( $rest, 0, (int) strpos( $rest, '/' ) );
+			$inner       = substr( $rest, strlen( $slug ) + 1 );
+			$version     = '';
+			if ( ! function_exists( 'get_plugins' ) ) {
+				require_once ABSPATH . 'wp-admin/includes/plugin.php';
+			}
+			foreach ( get_plugins() as $file => $data ) {
+				if ( dirname( $file ) === $slug ) {
+					$version = (string) $data['Version'];
+					break;
+				}
+			}
+			if ( $slug === '' || $version === '' ) {
+				return null;
+			}
+			$url = 'https://plugins.svn.wordpress.org/' . rawurlencode( $slug ) . '/tags/' . rawurlencode( $version ) . '/' . str_replace( '%2F', '/', rawurlencode( $inner ) );
+		} else {
+			return null;
+		}
+		$r = wp_remote_get( $url, array( 'timeout' => 15 ) );
+		if ( is_wp_error( $r ) || (int) wp_remote_retrieve_response_code( $r ) !== 200 ) {
+			return null;
+		}
+		return (string) wp_remote_retrieve_body( $r );
+	}
+
+	/** Line diff by longest common subsequence. Returns list of [type, text] with type ' ', '+', '-'. */
+	private static function diff_lines( $a, $b ) {
+		$a = explode( "\n", $a );
+		$b = explode( "\n", $b );
+		$n = count( $a );
+		$m = count( $b );
+		if ( $n * $m > 6000000 ) {
+			return null; // too big to diff in a request
+		}
+		$lcs = array_fill( 0, $n + 1, array_fill( 0, $m + 1, 0 ) );
+		for ( $i = $n - 1; $i >= 0; $i-- ) {
+			for ( $j = $m - 1; $j >= 0; $j-- ) {
+				$lcs[ $i ][ $j ] = $a[ $i ] === $b[ $j ] ? $lcs[ $i + 1 ][ $j + 1 ] + 1 : max( $lcs[ $i + 1 ][ $j ], $lcs[ $i ][ $j + 1 ] );
+			}
+		}
+		$out = array();
+		$i   = 0;
+		$j   = 0;
+		while ( $i < $n && $j < $m ) {
+			if ( $a[ $i ] === $b[ $j ] ) {
+				$out[] = array( ' ', $a[ $i ] );
+				$i++;
+				$j++;
+			} elseif ( $lcs[ $i + 1 ][ $j ] >= $lcs[ $i ][ $j + 1 ] ) {
+				$out[] = array( '-', $a[ $i ] );
+				$i++;
+			} else {
+				$out[] = array( '+', $b[ $j ] );
+				$j++;
+			}
+		}
+		for ( ; $i < $n; $i++ ) {
+			$out[] = array( '-', $a[ $i ] );
+		}
+		for ( ; $j < $m; $j++ ) {
+			$out[] = array( '+', $b[ $j ] );
+		}
+		return $out;
+	}
+
+	/** Every rule hit in the file, all occurrences: [line => [labels]], plus [line => [[start,len]]] for inline marks. */
+	private static function highlights( $content, $rel ) {
+		$ext   = MCSS_Scanner::ext( $rel );
+		$rules = MCSS_Scanner::rules();
+		$set   = MCSS_Scanner::is_php_ext( $ext ) ? $rules['php'] : ( $ext === 'js' ? $rules['js'] : $rules['conf'] );
+		$lines = array();
+		$marks = array();
+		$note  = function ( $pos, $len, $label ) use ( &$lines, &$marks, $content ) {
+			$line = substr_count( $content, "\n", 0, $pos ) + 1;
+			if ( ! isset( $lines[ $line ] ) || ! in_array( $label, $lines[ $line ], true ) ) {
+				$lines[ $line ][] = $label;
+			}
+			$start           = strrpos( substr( $content, 0, $pos ), "\n" );
+			$start           = $start === false ? 0 : $start + 1;
+			$marks[ $line ][] = array( $pos - $start, $len );
+		};
+		foreach ( (array) $set as $rule ) {
+			$first = (array) $rule[3];
+			$m     = array();
+			if ( @preg_match_all( $first[0], $content, $m, PREG_OFFSET_CAPTURE ) ) {
+				foreach ( array_slice( $m[0], 0, 50 ) as $hit ) {
+					$note( $hit[1], max( 1, strlen( $hit[0] ) ), $rule[2] );
+				}
+			}
+		}
+		if ( MCSS_Scanner::is_php_ext( $ext ) ) {
+			$tok = '~\b(eval|assert|system|exec|shell_exec|passthru|proc_open|popen|create_function|base64_decode|gzinflate|gzuncompress|gzdecode|str_rot13|hex2bin|wp_set_auth_cookie|wp_set_current_user|wp_insert_user|wp_create_user|file_put_contents|move_uploaded_file|curl_exec|fsockopen|wp_remote_get|wp_remote_post|wp_remote_request|call_user_func|call_user_func_array)\s*\(|\$_(?:GET|POST|REQUEST|COOKIE|FILES|SERVER)\b|php://input|all_plugins|pre_user_query|wp_head|wp_footer~i';
+			$m   = array();
+			if ( preg_match_all( $tok, $content, $m, PREG_OFFSET_CAPTURE ) ) {
+				foreach ( array_slice( $m[0], 0, 400 ) as $hit ) {
+					$note( $hit[1], strlen( $hit[0] ), 'behaviour: ' . strtolower( rtrim( $hit[0], "( \t" ) ) );
+				}
+			}
+		}
+		return array( $lines, $marks );
+	}
+
+	private static function redact( $content, $rel ) {
+		if ( ! preg_match( '~(^|/)wp-config[^/]*\.php$~', $rel ) ) {
+			return $content;
+		}
+		return preg_replace( "~(define\s*\(\s*['\"](?:DB_PASSWORD|DB_USER|DB_NAME|DB_HOST|AUTH_KEY|SECURE_AUTH_KEY|LOGGED_IN_KEY|NONCE_KEY|AUTH_SALT|SECURE_AUTH_SALT|LOGGED_IN_SALT|NONCE_SALT|WPE_APIKEY)['\"]\s*,\s*['\"])[^'\"]*(['\"])~", '$1[redacted]$2', $content );
+	}
+
+	public static function output() {
+		if ( ! current_user_can( MCSS_Scanner::cap() ) ) {
+			wp_die( 'Not allowed.' );
+		}
+		check_admin_referer( 'mcss_view' );
+		$k = isset( $_GET['k'] ) ? preg_replace( '~[^a-f0-9]~', '', (string) wp_unslash( $_GET['k'] ) ) : ''; // phpcs:ignore
+		$f = get_option( MCSS_Scanner::OPT_FINDINGS, array() );
+		$f = ( is_array( $f ) && isset( $f[ $k ] ) ) ? $f[ $k ] : null;
+		if ( ! $f || $f['path'] === '' || strpos( $f['path'], ':' ) !== false || substr( $f['path'], -1 ) === '/' ) {
+			wp_die( 'That finding is not a file.' );
+		}
+		$abs = MCSS_Scanner::abs( $f['path'] );
+		if ( ! is_file( $abs ) || ! is_readable( $abs ) ) {
+			wp_die( 'The file no longer exists or cannot be read.' );
+		}
+		$size    = (int) filesize( $abs );
+		$content = (string) file_get_contents( $abs, false, null, 0, self::MAX );
+		$content = self::redact( $content, $f['path'] );
+		list( $labels, $marks ) = self::highlights( $content, $f['path'] );
+		if ( $f['line'] ) {
+			$labels[ (int) $f['line'] ][] = 'this finding: ' . $f['title'];
+		}
+		$diff = null;
+		$want = ! empty( $_GET['diff'] ) && in_array( $f['rule'], array( 'core_modified', 'plugin_modified' ), true ); // phpcs:ignore
+		if ( $want ) {
+			$official = self::official_copy( $f );
+			$diff     = $official === null ? false : self::diff_lines( $official, $content );
+		}
+		$lines = explode( "\n", $content );
+		nocache_headers();
+		header( 'Content-Type: text/html; charset=utf-8' );
+		header( 'X-Content-Type-Options: nosniff' );
+		header( "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" );
+		MCSS_Log::add( 'file_viewed', $f['path'] );
+		?>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title><?php echo esc_html( basename( $f['path'] ) ); ?> (read-only)</title>
+<style>
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:#f6f7f7;color:#1d2327}
+.hd{background:#fff;border-bottom:1px solid #dcdcde;padding:12px 20px;position:sticky;top:0;z-index:2}
+.hd h1{font-size:15px;margin:0 0 4px;font-family:Consolas,Monaco,monospace;word-break:break-all}.hd p{margin:2px 0;font-size:13px;color:#50575e}
+.hd .sev{display:inline-block;padding:1px 7px;border-radius:3px;color:#fff;font-size:11px;font-weight:600;text-transform:uppercase;margin-right:6px}
+.high{background:#b32d2e}.medium{background:#bd8600}.low{background:#646970}
+.nav a{margin-right:14px;font-size:13px}
+pre{margin:0;font:12px/1.55 Consolas,Monaco,monospace;background:#fff}
+.ln{display:flex}.ln:hover{background:#f0f6fc}.n{width:64px;flex:none;text-align:right;padding:0 10px;color:#8c8f94;user-select:none;border-right:1px solid #eee}
+.c{padding:0 12px;white-space:pre-wrap;word-break:break-all;flex:1}
+.hit{background:#fff3cd}.hit .n{background:#ffe08a;color:#000}.hit.this{background:#fde2e2}.hit.this .n{background:#f5a3a3}
+mark{background:#ffbf47;color:#000;padding:0 1px;border-radius:2px}
+.lab{font-size:11px;color:#8a4b00;padding:0 12px 0 74px;background:#fff8e5;border-top:1px dashed #f0c36d}
+.this .lab{color:#8a1f1f;background:#fdeeee}
+.d{display:flex}.d .m{width:64px;flex:none;text-align:center;color:#8c8f94;border-right:1px solid #eee}
+.add{background:#e6ffed}.add .m{background:#acf2bd;color:#000}.del{background:#ffeef0}.del .m{background:#f7b8be;color:#000}
+.note{padding:10px 20px;font-size:13px;background:#fff8e5;border-bottom:1px solid #f0c36d}
+</style></head><body>
+<div class="hd">
+	<h1><?php echo esc_html( $f['path'] ); ?></h1>
+	<p><span class="sev <?php echo esc_attr( $f['sev'] ); ?>"><?php echo esc_html( $f['sev'] ); ?></span><?php echo esc_html( $f['title'] ); ?></p>
+	<p><?php echo esc_html( size_format( $size ) ); ?>, <?php echo count( $lines ); ?> lines, modified <?php echo esc_html( wp_date( 'M j, Y H:i', (int) filemtime( $abs ) ) ); ?>, sha256 <?php echo esc_html( hash_file( 'sha256', $abs ) ); ?><?php echo $size > self::MAX ? ', showing the first 2 MB only' : ''; ?>. Read-only: nothing on this page changes the file.</p>
+	<p class="nav">
+		<?php $n = 0; foreach ( $labels as $ln => $ls ) : if ( ++$n > 40 ) { break; } ?><a href="#L<?php echo (int) $ln; ?>">line <?php echo (int) $ln; ?></a><?php endforeach; ?>
+		<?php if ( in_array( $f['rule'], array( 'core_modified', 'plugin_modified' ), true ) && ! $want ) : ?><a href="<?php echo esc_url( add_query_arg( 'diff', '1' ) ); ?>"><strong>Compare with the official copy</strong></a><?php endif; ?>
+		<?php if ( $want ) : ?><a href="<?php echo esc_url( remove_query_arg( 'diff' ) ); ?>">Back to the file</a><?php endif; ?>
+	</p>
+</div>
+<?php if ( $want && $diff === false ) : ?>
+	<div class="note">The official copy could not be downloaded from wordpress.org right now, so there is nothing to compare against.</div>
+<?php elseif ( $want && $diff === null ) : ?>
+	<div class="note">The file is too large to diff in one request. Download it and compare locally.</div>
+<?php endif; ?>
+<?php if ( $want && is_array( $diff ) ) : ?>
+	<div class="note">Green lines exist only on this site (added). Red lines exist only in the official release (removed). Everything else matches.</div>
+	<pre><?php
+	$ctx = 0;
+	foreach ( $diff as $i => $d ) {
+		if ( $d[0] === ' ' ) {
+			$near = false;
+			for ( $j = max( 0, $i - 3 ); $j <= min( count( $diff ) - 1, $i + 3 ); $j++ ) {
+				if ( $diff[ $j ][0] !== ' ' ) {
+					$near = true;
+				}
+			}
+			if ( ! $near ) {
+				if ( $ctx++ === 0 ) {
+					echo '<div class="d"><div class="m">…</div><div class="c" style="color:#8c8f94">unchanged</div></div>';
+				}
+				continue;
+			}
+		}
+		$ctx = 0;
+		echo '<div class="d ' . ( $d[0] === '+' ? 'add' : ( $d[0] === '-' ? 'del' : '' ) ) . '"><div class="m">' . esc_html( $d[0] ) . '</div><div class="c">' . esc_html( $d[1] ) . '</div></div>';
+	}
+	?></pre>
+<?php else : ?>
+	<pre><?php
+	foreach ( $lines as $i => $line ) {
+		$no   = $i + 1;
+		$html = esc_html( $line );
+		if ( isset( $marks[ $no ] ) ) {
+			$spans = $marks[ $no ];
+			usort( $spans, function ( $a, $b ) { return $a[0] - $b[0]; } );
+			$html = '';
+			$pos  = 0;
+			$end  = 0;
+			foreach ( $spans as $sp ) {
+				$st = max( $sp[0], $end );
+				$en = min( strlen( $line ), $sp[0] + $sp[1] );
+				if ( $en <= $st ) {
+					continue;
+				}
+				$html .= esc_html( substr( $line, $pos, $st - $pos ) ) . '<mark>' . esc_html( substr( $line, $st, $en - $st ) ) . '</mark>';
+				$pos   = $en;
+				$end   = $en;
+			}
+			$html .= esc_html( substr( $line, $pos ) );
+		}
+		$is   = isset( $labels[ $no ] );
+		$cur = $is && (int) $f['line'] === $no;
+		echo '<div class="ln' . ( $is ? ' hit' : '' ) . ( $cur ? ' this' : '' ) . '" id="L' . $no . '"><div class="n">' . $no . '</div><div class="c">' . $html . '</div></div>';
+		if ( $is ) {
+			echo '<div class="lab' . ( $cur ? ' this' : '' ) . '">' . esc_html( implode( ' · ', array_unique( $labels[ $no ] ) ) ) . '</div>';
+		}
+	}
+	?></pre>
+<?php endif; ?>
+<script>if(location.hash){var e=document.querySelector(location.hash);if(e){e.scrollIntoView({block:'center'});}}</script>
+</body></html>
+		<?php
+		exit;
+	}
+}
+
+/* =========================================================================
  * Admin screens
  * ======================================================================= */
 
@@ -5403,6 +5662,7 @@ final class MCSS_Admin {
 		add_action( 'admin_post_mcss_save_hardening', array( __CLASS__, 'save_hardening' ) );
 		add_action( 'admin_post_mcss_log_csv', array( __CLASS__, 'log_csv' ) );
 		add_action( 'admin_post_mcss_client_report', array( 'MCSS_Report', 'output' ) );
+		add_action( 'admin_post_mcss_view', array( 'MCSS_Viewer', 'output' ) );
 		add_action( 'wp_ajax_mcss_quarantine', array( __CLASS__, 'ajax_quarantine' ) );
 		add_action( 'wp_ajax_mcss_fix', array( __CLASS__, 'ajax_fix' ) );
 		add_action( 'wp_ajax_mcss_repair', array( __CLASS__, 'ajax_repair' ) );
@@ -5715,6 +5975,9 @@ final class MCSS_Admin {
 						</td>
 						<td><?php echo $f['mt'] ? esc_html( wp_date( 'M j, Y H:i', (int) $f['mt'] ) ) : ''; ?></td>
 						<td class="acts">
+							<?php if ( $f['path'] !== '' && strpos( $f['path'], ':' ) === false && substr( $f['path'], -1 ) !== '/' && is_file( MCSS_Scanner::abs( $f['path'] ) ) ) : ?>
+								<a href="<?php echo esc_url( wp_nonce_url( admin_url( 'admin-post.php?action=mcss_view&k=' . $f['k'] ), 'mcss_view' ) ); ?>" target="_blank" rel="noopener">View file</a>
+							<?php endif; ?>
 							<?php foreach ( $acts as $a ) : ?>
 								<?php if ( isset( $a['href'] ) ) : ?>
 									<a href="<?php echo esc_url( $a['href'] ); ?>"><?php echo esc_html( $a['label'] ); ?></a>

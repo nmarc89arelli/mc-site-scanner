@@ -1,9 +1,9 @@
 {
-  "version": "1.7.1",
-  "download_url": "https://github.com/nmarc89arelli/mc-site-scanner/releases/download/v1.7.1/mc-site-scanner.zip",
+  "version": "1.7.2",
+  "download_url": "https://github.com/nmarc89arelli/mc-site-scanner/releases/download/v1.7.2/mc-site-scanner.zip",
   "requires": "5.8",
   "requires_php": "7.4",
   "tested": "7.1",
   "released": "2026-09-24",
-  "changelog": "Confidence scores and full explanations on behaviour findings"
+  "changelog": "File viewer with highlighted findings and official-copy diff"
 }
